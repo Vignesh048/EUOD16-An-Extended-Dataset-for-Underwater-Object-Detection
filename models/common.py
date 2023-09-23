@@ -1,15 +1,12 @@
-# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
 """
 Common modules
 """
 
-import ast
-import contextlib
 import json
 import math
 import platform
 import warnings
-import zipfile
 from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
@@ -24,24 +21,11 @@ import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
 
-# Import 'ultralytics' package or install if if missing
-try:
-    import ultralytics
-
-    assert hasattr(ultralytics, '__version__')  # verify package is not directory
-except (ImportError, AssertionError):
-    import os
-
-    os.system('pip install -U ultralytics')
-    import ultralytics
-
-from ultralytics.utils.plotting import Annotator, colors, save_one_box
-
-from utils import TryExcept
 from utils.dataloaders import exif_transpose, letterbox
 from utils.general import (LOGGER, ROOT, Profile, check_requirements, check_suffix, check_version, colorstr,
-                           increment_path, is_jupyter, make_divisible, non_max_suppression, scale_boxes, xywh2xyxy,
-                           xyxy2xywh, yaml_load)
+                           increment_path, make_divisible, non_max_suppression, scale_boxes, xywh2xyxy, xyxy2xywh,
+                           yaml_load)
+from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import copy_attr, smart_inference_mode
 
 
@@ -324,6 +308,7 @@ class Concat(nn.Module):
         return torch.cat(x, self.d)
 
 
+
 class DetectMultiBackend(nn.Module):
     # YOLOv5 MultiBackend class for python inference on various backends
     def __init__(self, weights='yolov5s.pt', device=torch.device('cpu'), dnn=False, data=None, fp16=False, fuse=True):
@@ -332,7 +317,7 @@ class DetectMultiBackend(nn.Module):
         #   TorchScript:                    *.torchscript
         #   ONNX Runtime:                   *.onnx
         #   ONNX OpenCV DNN:                *.onnx --dnn
-        #   OpenVINO:                       *_openvino_model
+        #   OpenVINO:                       *.xml
         #   CoreML:                         *.mlmodel
         #   TensorRT:                       *.engine
         #   TensorFlow SavedModel:          *_saved_model
@@ -345,7 +330,7 @@ class DetectMultiBackend(nn.Module):
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
         pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle, triton = self._model_type(w)
-        fp16 &= pt or jit or onnx or engine or triton  # FP16
+        fp16 &= pt or jit or onnx or engine  # FP16
         nhwc = coreml or saved_model or pb or tflite or edgetpu  # BHWC formats (vs torch BCWH)
         stride = 32  # default stride
         cuda = torch.cuda.is_available() and device.type != 'cpu'  # use CUDA
@@ -365,9 +350,8 @@ class DetectMultiBackend(nn.Module):
             model.half() if fp16 else model.float()
             if extra_files['config.txt']:  # load metadata dict
                 d = json.loads(extra_files['config.txt'],
-                               object_hook=lambda d: {
-                                   int(k) if k.isdigit() else k: v
-                                   for k, v in d.items()})
+                               object_hook=lambda d: {int(k) if k.isdigit() else k: v
+                                                      for k, v in d.items()})
                 stride, names = int(d['stride']), d['names']
         elif dnn:  # ONNX OpenCV DNN
             LOGGER.info(f'Loading {w} for ONNX OpenCV DNN inference...')
@@ -385,18 +369,18 @@ class DetectMultiBackend(nn.Module):
                 stride, names = int(meta['stride']), eval(meta['names'])
         elif xml:  # OpenVINO
             LOGGER.info(f'Loading {w} for OpenVINO inference...')
-            check_requirements('openvino>=2023.0')  # requires openvino-dev: https://pypi.org/project/openvino-dev/
+            check_requirements('openvino')  # requires openvino-dev: https://pypi.org/project/openvino-dev/
             from openvino.runtime import Core, Layout, get_batch
-            core = Core()
+            ie = Core()
             if not Path(w).is_file():  # if not *.xml
                 w = next(Path(w).glob('*.xml'))  # get *.xml file from *_openvino_model dir
-            ov_model = core.read_model(model=w, weights=Path(w).with_suffix('.bin'))
-            if ov_model.get_parameters()[0].get_layout().empty:
-                ov_model.get_parameters()[0].set_layout(Layout('NCHW'))
-            batch_dim = get_batch(ov_model)
+            network = ie.read_model(model=w, weights=Path(w).with_suffix('.bin'))
+            if network.get_parameters()[0].get_layout().empty:
+                network.get_parameters()[0].set_layout(Layout("NCHW"))
+            batch_dim = get_batch(network)
             if batch_dim.is_static:
                 batch_size = batch_dim.get_length()
-            ov_compiled_model = core.compile_model(ov_model, device_name='AUTO')  # AUTO selects best available device
+            executable_network = ie.compile_model(network, device_name="CPU")  # device_name="MYRIAD" for Intel NCS2
             stride, names = self._load_metadata(Path(w).with_suffix('.yaml'))  # load metadata
         elif engine:  # TensorRT
             LOGGER.info(f'Loading {w} for TensorRT inference...')
@@ -443,7 +427,7 @@ class DetectMultiBackend(nn.Module):
             import tensorflow as tf
 
             def wrap_frozen_graph(gd, inputs, outputs):
-                x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=''), [])  # wrapped
+                x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=""), [])  # wrapped
                 ge = x.graph.as_graph_element
                 return x.prune(tf.nest.map_structure(ge, inputs), tf.nest.map_structure(ge, outputs))
 
@@ -457,7 +441,7 @@ class DetectMultiBackend(nn.Module):
             gd = tf.Graph().as_graph_def()  # TF GraphDef
             with open(w, 'rb') as f:
                 gd.ParseFromString(f.read())
-            frozen_func = wrap_frozen_graph(gd, inputs='x:0', outputs=gd_outputs(gd))
+            frozen_func = wrap_frozen_graph(gd, inputs="x:0", outputs=gd_outputs(gd))
         elif tflite or edgetpu:  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
             try:  # https://coral.ai/docs/edgetpu/tflite-python/#update-existing-tf-lite-code-for-the-edge-tpu
                 from tflite_runtime.interpreter import Interpreter, load_delegate
@@ -477,12 +461,6 @@ class DetectMultiBackend(nn.Module):
             interpreter.allocate_tensors()  # allocate
             input_details = interpreter.get_input_details()  # inputs
             output_details = interpreter.get_output_details()  # outputs
-            # load metadata
-            with contextlib.suppress(zipfile.BadZipFile):
-                with zipfile.ZipFile(w, 'r') as model:
-                    meta_file = model.namelist()[0]
-                    meta = ast.literal_eval(model.read(meta_file).decode('utf-8'))
-                    stride, names = int(meta['stride']), meta['names']
         elif tfjs:  # TF.js
             raise NotImplementedError('ERROR: YOLOv5 TF.js inference is not supported')
         elif paddle:  # PaddlePaddle
@@ -490,7 +468,7 @@ class DetectMultiBackend(nn.Module):
             check_requirements('paddlepaddle-gpu' if cuda else 'paddlepaddle')
             import paddle.inference as pdi
             if not Path(w).is_file():  # if not *.pdmodel
-                w = next(Path(w).rglob('*.pdmodel'))  # get *.pdmodel file from *_paddle_model dir
+                w = next(Path(w).rglob('*.pdmodel'))  # get *.xml file from *_openvino_model dir
             weights = Path(w).with_suffix('.pdiparams')
             config = pdi.Config(str(w), str(weights))
             if cuda:
@@ -503,7 +481,7 @@ class DetectMultiBackend(nn.Module):
             check_requirements('tritonclient[all]')
             from utils.triton import TritonRemoteModel
             model = TritonRemoteModel(url=w)
-            nhwc = model.runtime.startswith('tensorflow')
+            nhwc = model.runtime.startswith("tensorflow")
         else:
             raise NotImplementedError(f'ERROR: {w} is not a supported format')
 
@@ -536,7 +514,7 @@ class DetectMultiBackend(nn.Module):
             y = self.session.run(self.output_names, {self.session.get_inputs()[0].name: im})
         elif self.xml:  # OpenVINO
             im = im.cpu().numpy()  # FP32
-            y = list(self.ov_compiled_model(im).values())
+            y = list(self.executable_network([im]).values())
         elif self.engine:  # TensorRT
             if self.dynamic and im.shape != self.bindings['images'].shape:
                 i = self.model.get_binding_index('images')
@@ -553,7 +531,7 @@ class DetectMultiBackend(nn.Module):
         elif self.coreml:  # CoreML
             im = im.cpu().numpy()
             im = Image.fromarray((im[0] * 255).astype('uint8'))
-            # im = im.resize((192, 320), Image.BILINEAR)
+            # im = im.resize((192, 320), Image.ANTIALIAS)
             y = self.model.predict({'image': im})  # coordinates are xywh normalized
             if 'confidence' in y:
                 box = xywh2xyxy(y['coordinates'] * [[w, h, w, h]])  # xyxy pixels
@@ -620,7 +598,7 @@ class DetectMultiBackend(nn.Module):
         url = urlparse(p)  # if url may be Triton inference server
         types = [s in Path(p).name for s in sf]
         types[8] &= not types[9]  # tflite &= not edgetpu
-        triton = not any(types) and all([any(s in url.scheme for s in ['http', 'grpc']), url.netloc])
+        triton = not any(types) and all([any(s in url.scheme for s in ["http", "grpc"]), url.netloc])
         return types + [triton]
 
     @staticmethod
@@ -704,9 +682,9 @@ class AutoShape(nn.Module):
                 s = im.shape[:2]  # HWC
                 shape0.append(s)  # image shape
                 g = max(size) / max(s)  # gain
-                shape1.append([int(y * g) for y in s])
+                shape1.append([y * g for y in s])
                 ims[i] = im if im.data.contiguous else np.ascontiguousarray(im)  # update
-            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)]  # inf shape
+            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)] if self.pt else size  # inf shape
             x = [letterbox(im, shape1, auto=False)[0] for im in ims]  # pad
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
             x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
@@ -779,11 +757,7 @@ class Detections:
 
             im = Image.fromarray(im.astype(np.uint8)) if isinstance(im, np.ndarray) else im  # from np
             if show:
-                if is_jupyter():
-                    from IPython.display import display
-                    display(im)
-                else:
-                    im.show(self.files[i])
+                im.show(self.files[i])  # show
             if save:
                 f = self.files[i]
                 im.save(save_dir / f)  # save
@@ -799,7 +773,6 @@ class Detections:
                 LOGGER.info(f'Saved results to {save_dir}\n')
             return crops
 
-    @TryExcept('Showing images is not supported in this environment')
     def show(self, labels=True):
         self._run(show=True, labels=labels)  # show results
 
@@ -862,22 +835,326 @@ class Proto(nn.Module):
 
 class Classify(nn.Module):
     # YOLOv5 classification head, i.e. x(b,c1,20,20) to x(b,c2)
-    def __init__(self,
-                 c1,
-                 c2,
-                 k=1,
-                 s=1,
-                 p=None,
-                 g=1,
-                 dropout_p=0.0):  # ch_in, ch_out, kernel, stride, padding, groups, dropout probability
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):  # ch_in, ch_out, kernel, stride, padding, groups
         super().__init__()
         c_ = 1280  # efficientnet_b0 size
         self.conv = Conv(c1, c_, k, s, autopad(k, p), g)
         self.pool = nn.AdaptiveAvgPool2d(1)  # to x(b,c_,1,1)
-        self.drop = nn.Dropout(p=dropout_p, inplace=True)
+        self.drop = nn.Dropout(p=0.0, inplace=True)
         self.linear = nn.Linear(c_, c2)  # to x(b,c2)
 
     def forward(self, x):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+### attension mechanism
+
+
+# SE
+class SE(nn.Module):
+    def __init__(self, c1, c2, ratio=16):
+        super(SE, self).__init__()
+        # c*1*1
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.l1 = nn.Linear(c1, c1 // ratio, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.l2 = nn.Linear(c1 // ratio, c1, bias=False)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avgpool(x).view(b, c)
+        y = self.l1(y)
+        y = self.relu(y)
+        y = self.l2(y)
+        y = self.sig(y)
+        y = y.view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+# CBAM
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.f1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.f2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.f2(self.relu(self.f1(self.avg_pool(x))))
+        max_out = self.f2(self.relu(self.f1(self.max_pool(x))))
+        out = self.sigmoid(avg_out + max_out)
+        return out
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        # (特征图的大小-算子的size+2*padding)/步长+1
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # 1*h*w
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        #2*h*w
+        x = self.conv(x)
+        #1*h*w
+        return self.sigmoid(x)
+
+
+class CBAM(nn.Module):
+    # CSP Bottleneck with 3 convolutions
+    def __init__(self, c1, c2, ratio=16, kernel_size=7):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttention(c1, ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        # c*h*w
+        # c*h*w * 1*h*w
+        out = self.spatial_attention(out) * out
+        return out
+
+
+# ECA
+class ECA(nn.Module):
+    """Constructs a ECA module.
+    Args:
+        channel: Number of channels of the input feature map
+        k_size: Adaptive selection of kernel size
+    """
+
+    def __init__(self, c1, c2, k_size=3):
+        super(ECA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # feature descriptor on the global spatial information
+        y = self.avg_pool(x)
+
+        # print(y.shape,y.squeeze(-1).shape,y.squeeze(-1).transpose(-1, -2).shape)
+        # Two different branches of ECA module
+        # 50*C*1*1
+        # 50*C*1
+        # 50*1*C
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+
+        # Multi-scale information fusion
+        y = self.sigmoid(y)
+
+        return x * y.expand_as(x)
+
+
+# CA
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAtt, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, inp // reduction)
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        # c*1*W
+        x_h = self.pool_h(x)
+        # c*H*1
+        # C*1*h
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        # C*1*(h+w)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        out = identity * a_w * a_h
+        return out
+
+
+# C3-SE
+class SEBottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, ratio=16):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        # self.se=SE(c1,c2,ratio)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.l1 = nn.Linear(c1, c1 // ratio, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.l2 = nn.Linear(c1 // ratio, c1, bias=False)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        x1 = self.cv2(self.cv1(x))
+        b, c, _, _ = x.size()
+        y = self.avgpool(x1).view(b, c)
+        y = self.l1(y)
+        y = self.relu(y)
+        y = self.l2(y)
+        y = self.sig(y)
+        y = y.view(b, c, 1, 1)
+        out = x1 * y.expand_as(x1)
+
+        # out=self.se(x1)*x1
+        return x + out if self.add else out
+
+
+class C3SE(C3):
+    # C3 module with SEBottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(SEBottleneck(c_, c_, shortcut) for _ in range(n)))
+
+
+# C3CBAM
+class CBAMBottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, ratio=16, kernel_size=7):  # ch_in, ch_out, shortcut, groups, expansion
+        super(CBAMBottleneck, self).__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        self.channel_attention = ChannelAttention(c2, ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+        #self.cbam=CBAM(c1,c2,ratio,kernel_size)
+
+    def forward(self, x):
+        x1 = self.cv2(self.cv1(x))
+        out = self.channel_attention(x1) * x1
+        # print('outchannels:{}'.format(out.shape))
+        out = self.spatial_attention(out) * out
+        return x + out if self.add else out
+
+
+class C3CBAM(C3):
+    # C3 module with CBAMBottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(CBAMBottleneck(c_, c_, shortcut) for _ in range(n)))
+
+
+# C3ECA
+class ECABottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, ratio=16, k_size=3):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        # self.eca=ECA(c1,c2)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x1 = self.cv2(self.cv1(x))
+        # out=self.eca(x1)*x1
+        y = self.avg_pool(x1)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        out = x1 * y.expand_as(x1)
+
+        return x + out if self.add else out
+
+
+class C3ECA(C3):
+    # C3 module with ECABottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(ECABottleneck(c_, c_, shortcut) for _ in range(n)))
+
+
+# C3EA
+class CABottleneck(nn.Module):
+    # Standard bottleneck
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, ratio=32):  # ch_in, ch_out, shortcut, groups, expansion
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.add = shortcut and c1 == c2
+        # self.ca=CoordAtt(c1,c2,ratio)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, c1 // ratio)
+        self.conv1 = nn.Conv2d(c1, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+        self.conv_h = nn.Conv2d(mip, c2, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, c2, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        x1=self.cv2(self.cv1(x))
+        n, c, h, w = x.size()
+        # c*1*W
+        x_h = self.pool_h(x1)
+        # c*H*1
+        # C*1*h
+        x_w = self.pool_w(x1).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        # C*1*(h+w)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        out = x1 * a_w * a_h
+
+        # out=self.ca(x1)*x1
+        return x + out if self.add else out
+
+
+class C3CA(C3):
+    # C3 module with CABottleneck()
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        self.m = nn.Sequential(*(CABottleneck(c_, c_,shortcut) for _ in range(n)))
